@@ -3,16 +3,15 @@
  *
  * Strategy: Collective SCAN (C-SCAN variant) with load balancing.
  *
- * Key ideas:
- *  1. Track all pending floor requests (up/down) globally.
- *  2. Assign the best idle elevator to serve a new floor request.
- *  3. Each elevator runs a directional sweep (like a disk head), picking
- *     up passengers along the way (via passing_floor), and only reverses
- *     direction when there is nothing further ahead.
- *  4. When idle, an elevator checks for any unserved floor calls and heads
- *     toward the nearest one in the most useful direction.
- *  5. goingUp/goingDown indicators are kept consistent so passengers board
- *     the correct elevator.
+ * Architecture note on error safety:
+ *   - Elevator event handlers (idle, passing_floor, stopped_at_floor,
+ *     floor_button_pressed) are wrapped by the game's tryTrigger() helper,
+ *     so exceptions there are caught by the game engine.
+ *   - Floor event handlers (up_button_pressed, down_button_pressed) are NOT
+ *     wrapped — any uncaught exception propagates to world.update() and
+ *     surfaces as an error in the game's updater loop. Therefore, floor
+ *     handlers must use only the safe public API (goToFloor) and must not
+ *     throw under any circumstances.
  */
 
 {
@@ -42,42 +41,21 @@
             }
         }
 
-        // Returns all floor numbers (from floor buttons OR pending calls) that
-        // this elevator should eventually serve given its current direction.
-        function floorsAhead(elevator, dir) {
-            var cur = elevator.currentFloor();
-            var pressed = elevator.getPressedFloors();
-            var result = [];
-
-            pressed.forEach(function(f) {
-                if (dir === "up" && f > cur) result.push(f);
-                if (dir === "down" && f < cur) result.push(f);
-            });
-
-            floors.forEach(function(floor) {
-                var fn = floor.floorNum();
-                if (dir === "up" && fn > cur && (pending[fn].up || pending[fn].down)) result.push(fn);
-                if (dir === "down" && fn < cur && (pending[fn].up || pending[fn].down)) result.push(fn);
-            });
-
-            // Deduplicate
-            result = result.filter(function(v, i, a) { return a.indexOf(v) === i; });
-            return result;
-        }
-
         // Returns all floors this elevator needs to visit regardless of direction.
         function allFloorsNeeded(elevator) {
             var pressed = elevator.getPressedFloors();
             var calls = [];
             floors.forEach(function(floor) {
                 var fn = floor.floorNum();
-                if (pending[fn].up || pending[fn].down) calls.push(fn);
+                var p = pending[fn];
+                if (p && (p.up || p.down)) calls.push(fn);
             });
             return pressed.concat(calls).filter(function(v, i, a) { return a.indexOf(v) === i; });
         }
 
         // Pick the "best" elevator for a new floor call at floorNum going in direction dir.
         // Prefer elevators already moving toward that floor and not full.
+        // Returns null if no suitable elevator found.
         function bestElevator(floorNum, dir) {
             var best = null;
             var bestScore = Infinity;
@@ -90,14 +68,13 @@
                 var dist = Math.abs(cur - floorNum);
                 var score;
 
-                // An elevator already heading the right way toward the floor is ideal
                 if ((elDir === "up" && dir === "up" && cur <= floorNum) ||
                     (elDir === "down" && dir === "down" && cur >= floorNum)) {
-                    score = dist; // best case
+                    score = dist;
                 } else if (elDir === "stopped") {
-                    score = dist + 5; // idle but available
+                    score = dist + 5;
                 } else {
-                    score = dist + (maxFloor * 2); // going the wrong way, penalise
+                    score = dist + (maxFloor * 2);
                 }
 
                 if (score < bestScore) {
@@ -109,45 +86,20 @@
             return best;
         }
 
-        // Dispatch an elevator to a floor, respecting its current sweep direction.
-        function dispatchToFloor(elevator, floorNum) {
-            var queue = elevator.destinationQueue;
-            if (queue.indexOf(floorNum) === -1) {
-                queue.push(floorNum);
-                // Sort according to current direction: up → ascending, down → descending.
-                var dir = elevator.destinationDirection();
-                var cur = elevator.currentFloor();
-                if (dir === "up" || (dir === "stopped" && floorNum >= cur)) {
-                    queue.sort(function(a, b) { return a - b; });
-                } else {
-                    queue.sort(function(a, b) { return b - a; });
-                }
-                elevator.destinationQueue = queue;
-                elevator.checkDestinationQueue();
-            }
-        }
-
-        // When an elevator stops, clear the pending flag for that floor in the
-        // appropriate direction(s), and also serve interior button presses.
-        function handleStop(elevator, floorNum) {
-            // Clear pending based on current direction indicators
-            if (elevator.goingUpIndicator()) pending[floorNum].up = false;
-            if (elevator.goingDownIndicator()) pending[floorNum].down = false;
-        }
-
         // Central "what should this elevator do next?" logic, called when idle.
+        // Runs inside the game's tryTrigger() safety wrapper — safe to do
+        // direct destinationQueue manipulation here.
         function scheduleIdle(elevator) {
             var cur = elevator.currentFloor();
             var needed = allFloorsNeeded(elevator);
 
             if (needed.length === 0) {
-                // Park at ground floor if completely idle, to be ready.
                 setIndicators(elevator, "both");
                 if (cur !== 0) elevator.goToFloor(0);
                 return;
             }
 
-            // Find nearest needed floor
+            // Find nearest needed floor to decide sweep direction.
             var nearest = needed.reduce(function(prev, f) {
                 return Math.abs(f - cur) < Math.abs(prev - cur) ? f : prev;
             });
@@ -155,7 +107,7 @@
             var dir = nearest >= cur ? "up" : "down";
             setIndicators(elevator, dir);
 
-            // Build sorted queue: sweep in direction of nearest, handle the rest after.
+            // Build sorted queue: serve floors ahead first, then reverse for the rest.
             var ahead = needed.filter(function(f) {
                 return dir === "up" ? f >= cur : f <= cur;
             });
@@ -181,47 +133,69 @@
 
             setIndicators(elevator, "both");
 
-            // Idle: recalculate best route
             elevator.on("idle", function() {
                 scheduleIdle(elevator);
             });
 
-            // A passenger inside pressed a floor button → add it to queue in order
+            // Passenger inside pressed a floor button.
             elevator.on("floor_button_pressed", function(floorNum) {
-                dispatchToFloor(elevator, floorNum);
-            });
-
-            // About to pass a floor: decide whether to stop
-            elevator.on("passing_floor", function(floorNum, direction) {
-                // Stop if there are passengers waiting in that direction OR who want this floor
-                var pressed = elevator.getPressedFloors();
-                var wantThisFloor = pressed.indexOf(floorNum) !== -1;
-                var waitingUp = pending[floorNum].up && direction === "up";
-                var waitingDown = pending[floorNum].down && direction === "down";
-                var canTakeMore = elevator.loadFactor() < 0.85;
-
-                if (wantThisFloor || ((waitingUp || waitingDown) && canTakeMore)) {
-                    elevator.goToFloor(floorNum, true); // insert at front of queue
+                // Add to queue respecting current sweep direction.
+                var cur = elevator.currentFloor();
+                var dir = elevator.destinationDirection();
+                var queue = elevator.destinationQueue;
+                if (queue.indexOf(floorNum) === -1) {
+                    queue.push(floorNum);
+                    if (dir === "up" || (dir === "stopped" && floorNum >= cur)) {
+                        queue.sort(function(a, b) { return a - b; });
+                    } else {
+                        queue.sort(function(a, b) { return b - a; });
+                    }
+                    elevator.destinationQueue = queue;
+                    elevator.checkDestinationQueue();
                 }
             });
 
-            // Stopped: update indicators and clear pending flags
-            elevator.on("stopped_at_floor", function(floorNum) {
-                handleStop(elevator, floorNum);
+            // About to pass a floor: decide whether to stop.
+            elevator.on("passing_floor", function(floorNum, direction) {
+                var p = pending[floorNum] || { up: false, down: false };
+                var pressed = elevator.getPressedFloors();
+                var wantThisFloor = pressed.indexOf(floorNum) !== -1;
+                var waitingInDir = (direction === "up" && p.up) || (direction === "down" && p.down);
+                var canTakeMore = elevator.loadFactor() < 0.85;
 
-                // Determine what's still needed above/below to set indicator
-                var pressedAbove = elevator.getPressedFloors().some(function(f) { return f > floorNum; });
-                var pressedBelow = elevator.getPressedFloors().some(function(f) { return f < floorNum; });
-                var callAbove = floors.some(function(fl) { return fl.floorNum() > floorNum && (pending[fl.floorNum()].up || pending[fl.floorNum()].down); });
-                var callBelow = floors.some(function(fl) { return fl.floorNum() < floorNum && (pending[fl.floorNum()].up || pending[fl.floorNum()].down); });
+                if (wantThisFloor || (waitingInDir && canTakeMore)) {
+                    elevator.goToFloor(floorNum, true);
+                }
+            });
+
+            // Stopped at a floor: clear pending flags and update direction indicators.
+            elevator.on("stopped_at_floor", function(floorNum) {
+                var p = pending[floorNum];
+                if (p) {
+                    if (elevator.goingUpIndicator()) p.up = false;
+                    if (elevator.goingDownIndicator()) p.down = false;
+                }
+
                 var queue = elevator.destinationQueue;
                 var nextUp = queue.some(function(f) { return f > floorNum; });
                 var nextDown = queue.some(function(f) { return f < floorNum; });
+                var pressed = elevator.getPressedFloors();
+                var pressedAbove = pressed.some(function(f) { return f > floorNum; });
+                var pressedBelow = pressed.some(function(f) { return f < floorNum; });
+                var callAbove = floors.some(function(fl) {
+                    var fn = fl.floorNum();
+                    var fp = pending[fn];
+                    return fn > floorNum && fp && (fp.up || fp.down);
+                });
+                var callBelow = floors.some(function(fl) {
+                    var fn = fl.floorNum();
+                    var fp = pending[fn];
+                    return fn < floorNum && fp && (fp.up || fp.down);
+                });
 
                 var goingUp = nextUp || (!nextDown && (pressedAbove || callAbove));
                 var goingDown = nextDown || (!nextUp && (pressedBelow || callBelow));
 
-                // If uncertain (at top/bottom), allow both
                 if (!goingUp && !goingDown) {
                     setIndicators(elevator, "both");
                 } else {
@@ -232,33 +206,33 @@
         });
 
         // ----- Wire up each floor -----
+        // IMPORTANT: floor event handlers are NOT wrapped by the game's error
+        // handler. Only use the safe public goToFloor() API here — no direct
+        // destinationQueue manipulation.
         floors.forEach(function(floor) {
             var fn = floor.floorNum();
 
             floor.on("up_button_pressed", function() {
                 pending[fn].up = true;
                 var el = bestElevator(fn, "up");
-                if (el) dispatchToFloor(el, fn);
+                if (el) el.goToFloor(fn);
             });
 
             floor.on("down_button_pressed", function() {
                 pending[fn].down = true;
                 var el = bestElevator(fn, "down");
-                if (el) dispatchToFloor(el, fn);
+                if (el) el.goToFloor(fn);
             });
         });
     },
 
     update: function(dt, elevators, floors) {
-        // Most logic is event-driven; update is used for periodic health checks.
-        // Detect any stuck elevators (idle with unserved requests) and nudge them.
+        // Periodic health-check: rescue any interior button presses that the
+        // event system might have missed (e.g. after a queue reset).
         elevators.forEach(function(elevator) {
             if (elevator.destinationQueue.length === 0) {
                 var pressed = elevator.getPressedFloors();
-                if (pressed.length > 0) {
-                    // Somehow lost track of a button press; go there now.
-                    pressed.forEach(function(f) { elevator.goToFloor(f); });
-                }
+                pressed.forEach(function(f) { elevator.goToFloor(f); });
             }
         });
     }
